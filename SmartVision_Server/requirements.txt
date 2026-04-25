@@ -1,0 +1,17 @@
+fastapi==0.110.0
+uvicorn==0.27.1
+torch==2.2.1
+torchvision==0.17.1
+transformers==4.38.2
+pillow==10.2.0
+python-multipart==0.0.9
+einops==0.7.0
+timm==0.9.16
+python-dotenv==1.0.1
+gTTS
+openai-whisper
+paddlepaddle
+paddleocr
+opencv-python
+shapely
+pyclipper

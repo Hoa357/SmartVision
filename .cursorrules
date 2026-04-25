@@ -1,0 +1,402 @@
+# ============================================================
+# REACT NATIVE PERFORMANCE & TESTING — .cursorrules
+# Nguồn: Callstack RNTL (github.com/callstack/react-native-testing-library)
+#         + React Native Docs (reactnative.dev/docs/performance)
+#         + FlashList Docs (shopify.github.io/flash-list)
+# ============================================================
+
+
+# ─────────────────────────────────────────
+# SKILL 1: TỐI ƯU FPS — JS Thread & UI Thread
+# ─────────────────────────────────────────
+
+## Nguyên tắc cốt lõi
+- Mục tiêu: duy trì >= 60 FPS → mỗi frame phải hoàn thành trong 16.67ms.
+- Có 2 thread cần theo dõi riêng biệt:
+  - **JS Thread** (mqt_js): xử lý React logic, state, API calls, event handling.
+  - **UI Thread** (main thread): đo layout, vẽ native view, chạy animation.
+
+## Tránh drop FPS trên JS Thread
+- Không để heavy computation chạy thẳng trên render cycle; dùng `InteractionManager.runAfterInteractions()` để trì hoãn công việc nặng đến sau animation/transition.
+- Dùng `requestAnimationFrame()` để wrap hành động tốn kém trong `onPress` handler:
+  ```js
+  function handleOnPress() {
+    requestAnimationFrame(() => { doExpensiveAction(); });
+  }
+  ```
+- Xoá toàn bộ `console.log` trước khi build production; dùng babel plugin `transform-remove-console` để tự động loại bỏ:
+  ```json
+  { "env": { "production": { "plugins": ["transform-remove-console"] } } }
+  ```
+- Không test performance ở dev mode (`dev=true`); luôn đo bằng **release build**.
+- Tránh re-render toàn bộ cây component khi chỉ thay đổi một props nhỏ; dùng `React.memo`, `useMemo`, `useCallback` đúng chỗ.
+- Với Animated: luôn bật `useNativeDriver: true` để chuyển animation sang UI Thread, tránh chặn JS Thread.
+- Dùng `LayoutAnimation` cho "fire-and-forget" animation (ví dụ: modal slide-in) vì nó chạy trên Core Animation, không bị ảnh hưởng bởi JS thread drop.
+
+## Tránh drop FPS trên UI Thread
+- Khi có alpha compositing phức tạp (text đè lên ảnh, transparent overlay), bật `renderToHardwareTextureAndroid` trên Android và `shouldRasterizeIOS` trên iOS cho các View tĩnh.
+- Không lạm dụng `needsOffscreenAlphaCompositing` vì tăng GPU load mỗi frame.
+- Để animate kích thước ảnh, dùng `transform: [{ scale }]` thay vì thay đổi `width`/`height` trực tiếp (tránh re-crop từ ảnh gốc).
+- Navigation transition nên dùng native-stack (`@react-navigation/native-stack`) để animation chạy 100% trên UI Thread.
+- ScrollView scroll không cần JS Thread; chỉ fire scroll event lên JS → không block UX.
+
+
+# ─────────────────────────────────────────
+# SKILL 2: LIST OPTIMIZATION — FlatList & FlashList
+# ─────────────────────────────────────────
+
+## FlatList — Props tối ưu chuẩn
+- `initialNumToRender`: đặt đúng số item vừa đủ để fill màn hình lần đầu (avoid blank areas khi load).
+- `maxToRenderPerBatch`: số item render mỗi batch khi scroll; tăng = ít blank, nhưng dễ block JS thread → cân bằng tùy use case.
+- `updateCellsBatchingPeriod`: delay (ms) giữa các batch; kết hợp với `maxToRenderPerBatch` để kiểm soát fill-rate vs responsiveness.
+- `windowSize`: mặc định 21 (10 viewport trên + 10 dưới + 1 hiện tại); giảm để tiết kiệm RAM, tăng để tránh blank khi scroll nhanh.
+- `removeClippedSubviews={true}`: detach native views ngoài viewport khỏi native hierarchy → giảm tải UI thread (nhưng có thể gây bug missing content trên iOS với complex layout).
+- `getItemLayout`: **BẮT BUỘC** nếu item có chiều cao cố định → bỏ qua async measurement, tăng tốc cuộn đáng kể:
+  ```js
+  getItemLayout={(data, index) => ({ length: ITEM_HEIGHT, offset: ITEM_HEIGHT * index, index })}
+  ```
+- `keyExtractor`: luôn cung cấp unique key để React cache và track item re-ordering chính xác.
+
+## FlatList — Item Component chuẩn
+- Wrap item với `React.memo()` và custom comparison function để tránh re-render không cần thiết:
+  ```js
+  const MyItem = memo(({ title }) => <View><Text>{title}</Text></View>,
+    (prev, next) => prev.title === next.title
+  );
+  ```
+- Định nghĩa `renderItem` bên ngoài JSX và wrap bằng `useCallback` để tránh tạo lại mỗi render:
+  ```js
+  const renderItem = useCallback(({ item }) => <MyItem title={item.title} />, []);
+  ```
+- Dùng ảnh thumbnail/crop nhỏ trong list; dùng `@d11/react-native-fast-image` để cache và load nhanh hơn `Image` gốc.
+- Tránh logic phức tạp và nesting sâu trong item component; chuyển detail vào màn hình riêng.
+
+## FlashList (Shopify) — Khuyến nghị dùng thay FlatList cho list lớn
+- Đổi `FlatList` → `FlashList` (import từ `@shopify/flash-list`); API tương tự nhau.
+- **Bắt buộc** bỏ `key` prop trong `renderItem` hierarchy (FlashList tự quản lý recycling).
+- Cung cấp `estimatedItemSize` (số pixel ước tính) để FlashList tính toán layout ban đầu chính xác.
+- Dùng `getItemType` nếu list có nhiều loại item khác nhau → FlashList pool riêng từng type, tăng hiệu quả recycling:
+  ```js
+  getItemType={(item) => item.type}
+  ```
+- Luôn có `keyExtractor` hợp lệ (quan trọng với v2) để tránh glitch khi scroll ngược.
+- Khi dùng `useState` trong item component, kiểm tra xem state có cần reset khi item được recycle không (dùng `useRecyclingState` hook của FlashList).
+- Nếu nest horizontal FlashList trong vertical list → vertical list cũng nên là FlashList để tối ưu layout timing.
+- Không measure performance ở dev mode; FlashList có render buffer nhỏ hơn trong dev → kết quả bị lệch.
+- Memoize tất cả props truyền vào FlashList (v2 yêu cầu strict hơn v1).
+
+
+# ─────────────────────────────────────────
+# SKILL 3: TESTING & DEBUGGING
+# ─────────────────────────────────────────
+
+## Viết test nhanh với React Native Testing Library (RNTL)
+
+### Setup
+```bash
+npm install --save-dev @testing-library/react-native
+```
+- Import bất kỳ thứ gì từ `@testing-library/react-native` → Jest matchers tự kích hoạt.
+
+### Core API cần nhớ
+- `render(<Component />)` → render component vào virtual tree.
+- `screen` object → truy cập toàn bộ rendered UI sau `render()`.
+- **Queries** (theo thứ tự ưu tiên):
+  - `getByRole('button', { name: 'Submit' })` → tốt nhất, giống cách user trải nghiệm.
+  - `getByLabelText('answer input')` → cho form fields.
+  - `getByText('Hello')` → match text.
+  - `getByTestId('my-id')` → cuối cùng, chỉ khi không có cách khác.
+- **Async queries**: dùng `findBy*` thay `getBy*` khi element xuất hiện sau async operation.
+- `waitFor(callback)` → polling đến khi assertion pass; dùng cho state update bất đồng bộ.
+- `waitForElementToBeRemoved(element)` → chờ element biến mất khỏi DOM.
+
+### Simulate user interaction
+- Ưu tiên dùng `userEvent` (v14+) — mô phỏng thực tế nhất:
+  ```js
+  const user = userEvent.setup();
+  await user.type(input, 'hello');   // gõ từng ký tự
+  await user.press(button);          // nhấn nút
+  ```
+- Dùng `fireEvent` khi cần trigger custom event không có trong userEvent:
+  ```js
+  fireEvent(element, 'onCustomEvent', { data: 'value' });
+  ```
+
+### Test hooks
+```js
+const { result } = renderHook(() => useMyHook());
+expect(result.current.value).toBe(expected);
+```
+
+### Patterns nên theo
+- Test **behavior** (output + interaction), không test **implementation** (internal state, method names).
+- Mỗi test độc lập: không share state giữa test cases (`cleanup` tự động chạy sau mỗi test).
+- Dùng `within(container)` để scope query vào sub-tree cụ thể.
+- Dùng `screen.debug()` để in ra component tree khi cần debug thủ công.
+- Mock external dependencies (API, navigation) ở mức module; không mock internal logic.
+- Dùng `rerender(<Component newProps />)` để test prop changes mà không re-mount.
+
+### Avoid
+- Không dùng `act()` thủ công nếu đã dùng `userEvent` (đã tự wrap `act`).
+- Không query bằng index (`getAllByRole('button')[2]`) → brittle test.
+- Không snapshot test cho dynamic content → dùng specific assertions thay.
+
+## Dùng Profiler để tìm nguyên nhân gây chậm
+
+### Bước 1 — Chuẩn bị
+- Luôn profile trên **release build** và **thiết bị thật** (không dùng simulator/emulator).
+- Bật "Show Perf Monitor" từ Dev Menu để xem FPS của JS Thread và UI Thread realtime.
+- Tắt hoàn toàn dev mode trước khi đo.
+
+### Bước 2 — Android: Android Studio Profiler (System Tracing)
+1. Build app ở chế độ `profileable`.
+2. Mở Android Studio Profiler → chọn "Capture System Activities".
+3. Thực hiện interaction/animation cần đo → nhấn "Stop recording".
+4. Phân tích trace trong Android Studio hoặc export sang [Perfetto](https://perfetto.dev/).
+
+### Bước 3 — Đọc trace và xác định thủ phạm
+- **JS Thread busy** (mqt_js chạy vượt 16ms boundary) → vấn đề ở JavaScript:
+  - Tìm component re-render không cần → thêm `React.memo` hoặc `shouldComponentUpdate`.
+  - Tìm heavy computation trong render → chuyển sang `useMemo` hoặc trì hoãn bằng `InteractionManager`.
+- **UI Thread / Render Thread busy** (DrawFrame vượt frame boundary) → vấn đề ở native view:
+  - Bật `renderToHardwareTextureAndroid` cho complex animated views.
+  - Tránh tạo new UI trong lúc đang animation (postpone UI creation đến sau interaction).
+  - Kiểm tra GPU overload: giảm alpha compositing, tắt `needsOffscreenAlphaCompositing`.
+- **Native CPU hotspot**: dùng "Find CPU Hotspots (Java/Kotlin Method Recording)" trong Android Studio Profiler để xác định native method nào chiếm nhiều thời gian.
+
+### Bước 4 — iOS: Instruments
+- Dùng **Instruments** (Time Profiler) để trace iOS-specific performance issues.
+- Xem call stack để tìm method chiếm thời gian nhiều nhất trên main thread.
+
+### Quick checklist khi app bị giật
+- [ ] Đang test trên release build chưa?
+- [ ] Có `console.log` nào còn sót không?
+- [ ] Animated có `useNativeDriver: true` không?
+- [ ] FlatList có `getItemLayout` + `keyExtractor` không?
+- [ ] Item component có `React.memo` không?
+- [ ] Có re-render không cần thiết nào (dùng React DevTools Profiler)?
+- [ ] Navigator dùng native-stack chưa?
+- [ ] InteractionManager được dùng đúng chỗ chưa?
+
+
+# ============================================================
+# PRECEDENT TEMPLATE — Rules rút ra từ steven-tey/precedent
+# Nguồn: https://github.com/steven-tey/precedent
+# Stack: Next.js 13+ App Router, TypeScript, Tailwind, Radix UI
+# ============================================================
+
+
+# ─────────────────────────────────────────
+# SKILL 4: AI-FRIENDLY CODING
+# (Viết code, đặt tên để AI đọc hiểu nhanh nhất)
+# ─────────────────────────────────────────
+
+## Đặt tên biến & hàm
+- Dùng tên mô tả intent, không mô tả implementation:
+  - ✅ `showModal`, `setShowModal`, `openPopover`, `isMobile`
+  - ❌ `flag`, `val`, `temp`, `data2`
+- Tên state theo cặp nhất quán: `[noun]` + `set[Noun]`:
+  ```ts
+  const [showModal, setShowModal] = useState(false);
+  const [openPopover, setOpenPopover] = useState(false);
+  ```
+- Props type inline ngay bên cạnh function signature (không tách interface khi không cần reuse):
+  ```ts
+  export default function Modal({
+    showModal, setShowModal,
+  }: {
+    showModal: boolean;
+    setShowModal: Dispatch<SetStateAction<boolean>>;
+  }) { ... }
+  ```
+
+## Cấu trúc hàm để AI debug dễ
+- Mỗi utility function có một mục đích duy nhất, đặt tên verb + noun: `nFormatter()`, `timeAgo()`, `truncate()`, `capitalize()`, `fetcher()`.
+- Xử lý edge case ngay đầu hàm (early return), tránh nesting sâu:
+  ```ts
+  export const timeAgo = (timestamp: Date): string => {
+    if (!timestamp) return "never"; // early return trước
+    return `${ms(Date.now() - new Date(timestamp).getTime())} ago`;
+  };
+  ```
+- Typed generic functions cho reusability và AI inference:
+  ```ts
+  export async function fetcher<JSON = any>(input: RequestInfo): Promise<JSON>
+  ```
+- File `lib/utils.ts` chỉ export pure functions, zero side effects → AI đọc và test độc lập được.
+
+## Alias import để AI navigation nhanh
+- Dùng path alias `@/` để AI biết ngay file đến từ đâu:
+  ```ts
+  import { cn } from "@/lib/utils";
+  import useMediaQuery from "@/lib/hooks/use-media-query";
+  import Navbar from "@/components/layout/navbar";
+  ```
+- Convention cứng: `@/lib/` = logic, `@/components/` = UI, `@/app/` = pages/routing.
+- Export tường minh (`export default function Name`) — AI biết ngay đây là component chính.
+- Không dùng `any` tùy tiện; khi cần generic thì type tường minh.
+
+
+# ─────────────────────────────────────────
+# SKILL 5: CLEAN ARCHITECTURE
+# (Tách logic & UI — chuẩn Precedent)
+# ─────────────────────────────────────────
+
+## Cấu trúc thư mục chuẩn
+```
+app/                    ← Next.js pages, layouts (routing layer)
+  layout.tsx            ← global providers, fonts, metadata
+  page.tsx              ← thin page: chỉ compose components, không chứa logic
+components/
+  layout/               ← shell components (Navbar, Footer)
+  shared/               ← reusable UI primitives (Modal, Popover, Button)
+lib/
+  hooks/                ← custom React hooks (logic tái sử dụng)
+  utils.ts              ← pure utility functions (zero UI dependency)
+```
+
+## Quy tắc tách logic khỏi UI
+
+### Rule 1 — Responsive logic → hook, không inline trong component
+```ts
+// lib/hooks/use-media-query.ts
+export default function useMediaQuery() {
+  const [device, setDevice] = useState<"mobile"|"tablet"|"desktop"|null>(null);
+  useEffect(() => {
+    const check = () => { /* matchMedia logic */ };
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+  return { isMobile: device === "mobile", isTablet: device === "tablet", isDesktop: device === "desktop" };
+}
+```
+
+### Rule 2 — Component adaptive: 1 component, 2 rendering path (mobile/desktop)
+Không tạo 2 file riêng cho mobile/desktop; dùng conditional render trong cùng 1 component:
+```ts
+const { isMobile } = useMediaQuery();
+if (isMobile) return <Drawer.Root>...</Drawer.Root>;
+return <Dialog.Root>...</Dialog.Root>;
+```
+
+### Rule 3 — Providers ở layout, không ở pages
+Tất cả global context (Auth, Analytics, Theme) đặt tại `app/layout.tsx`:
+```tsx
+<ClerkProvider>
+  <html><body>
+    <Suspense fallback="..."><Navbar /></Suspense>
+    <main>{children}</main>
+    <Footer />
+    <VercelAnalytics />
+  </body></html>
+</ClerkProvider>
+```
+
+### Rule 4 — Lazy load async component bằng `<Suspense>`
+Bọc component fetch async data bằng `<Suspense>` → không block initial render:
+```tsx
+<Suspense fallback="...">
+  <Navbar /> {/* fetch session async bên trong */}
+</Suspense>
+```
+
+### Rule 5 — `"use client"` directive rõ ràng, tối thiểu
+- Chỉ thêm `"use client"` khi component thực sự cần: `useState`, `useEffect`, event handlers, browser API.
+- Page/layout = Server Component mặc định → nhẹ hơn, SEO tốt hơn.
+- Interactive primitive (Modal, Popover) = Client Component có `"use client"`.
+
+### Rule 6 — Class utility với `cn()` thay template literal
+```ts
+// lib/utils.ts
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs)); // clsx + tailwind-merge để xử lý conflict
+}
+// Trong component:
+className={cn("base-class", isActive && "active-class", className)}
+```
+
+### Rule 7 — API fetcher với typed error
+```ts
+export async function fetcher<JSON>(input: RequestInfo): Promise<JSON> {
+  const res = await fetch(input);
+  if (!res.ok) {
+    const json = await res.json();
+    const error = new Error(json.error) as Error & { status: number };
+    error.status = res.status;
+    throw error; // typed error, consumer tự handle
+  }
+  return res.json();
+}
+```
+
+
+# ─────────────────────────────────────────
+# SKILL 6: OPTIMIZATION — Font, Image & Bandwidth
+# (Kỹ thuật tối ưu từ Precedent)
+# ─────────────────────────────────────────
+
+## Font Optimization
+- Dùng `next/font` để self-host font → zero layout shift, không gọi Google Fonts runtime:
+  ```ts
+  import { Inter } from "next/font/google";
+  export const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
+  ```
+- Inject font qua CSS variable vào `<body>` class, không inline style:
+  ```tsx
+  <body className={cx(sfPro.variable, inter.variable)}>
+  ```
+- Khai báo trong `tailwind.config.js` qua CSS variable:
+  ```js
+  fontFamily: {
+    display: ["var(--font-sf)", "system-ui", "sans-serif"],
+    default: ["var(--font-inter)", "system-ui", "sans-serif"],
+  }
+  ```
+- Luôn có `system-ui` và `sans-serif` fallback để tránh FOUT.
+
+## Image Optimization
+- Whitelist domain ảnh trong `next.config.js`:
+  ```js
+  images: { domains: ["lh3.googleusercontent.com", "vercel.com"] }
+  ```
+- Dùng `<Image>` từ `next/image` → tự động WebP, lazy load, responsive srcset, blur placeholder.
+- Decorative background → CSS gradient thuần, không dùng ảnh:
+  ```tsx
+  <div className="fixed h-screen w-full bg-gradient-to-br from-indigo-50 via-white to-cyan-100" />
+  ```
+
+## Bandwidth Optimization
+- `swcMinify: true` → minify JS bằng SWC (nhanh hơn Terser ~20x).
+- `reactStrictMode: true` → phát hiện side effect sớm, giảm bug production.
+- Animation dùng Tailwind CSS keyframes, không dùng JS animation:
+  ```js
+  animation: { "fade-up": "fade-up 0.5s", "slide-up-fade": "slide-up-fade 0.3s cubic-bezier(0.16, 1, 0.3, 1)" }
+  ```
+- `hoverOnlyWhenSupported: true` trong Tailwind config → không generate hover CSS trên touch device → giảm CSS payload.
+- Redirect khai báo trong `next.config.js` server-side, không dùng middleware JS:
+  ```js
+  async redirects() {
+    return [{ source: "/github", destination: "https://...", permanent: false }];
+  }
+  ```
+- Metadata SEO khai báo tĩnh trong layout → generate lúc build, không tốn runtime:
+  ```ts
+  export const metadata = {
+    title: "...", description: "...",
+    metadataBase: new URL("https://your-domain.com"),
+  };
+  ```
+
+## Quick Checklist — Trước khi commit (Precedent standards)
+- [ ] Font dùng `next/font`, không dùng `<link>` Google Fonts?
+- [ ] CSS variable font inject qua `<body className>` chưa?
+- [ ] Ảnh dùng `<Image>` next/image? Domain đã whitelist chưa?
+- [ ] Background decorative dùng CSS gradient thay ảnh?
+- [ ] Animation dùng Tailwind CSS keyframes, không JS?
+- [ ] `cn()` được dùng để merge Tailwind class?
+- [ ] `"use client"` tối thiểu, chỉ ở component cần browser API?
+- [ ] Providers đặt ở `app/layout.tsx`, không rải vào từng page?
+- [ ] Async component được bọc `<Suspense>` trước khi load?
+- [ ] API fetcher có typed error với `.status` chưa?
+- [ ] Utility functions trong `lib/utils.ts` là pure functions?

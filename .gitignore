@@ -1,0 +1,21 @@
+# Python
+SmartVision_Server/env/
+SmartVision_Server/__pycache__/
+SmartVision_Server/*.pyc
+SmartVision_Server/.env
+
+# Node / React Native
+SmartVisionMobile/node_modules/
+SmartVision/node_modules/
+SmartVisionMobile/.expo/
+SmartVisionMobile/dist/
+
+# Large Files
+SmartVision_Server/ffmpeg.exe
+
+# OS
+.DS_Store
+Thumbs.db
+
+SmartVision_Server/*.pt
+SmartVision_Server/Models/*.pt
